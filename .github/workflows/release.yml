@@ -1,0 +1,112 @@
+name: Release
+
+# A push to main releases only when a commit message contains
+# upgrade(major), upgrade(minor), upgrade(patch) or upgrade(vX.Y.Z).
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      release: ${{ steps.next.outputs.release }}
+      version: ${{ steps.next.outputs.version }}
+      tag: ${{ steps.next.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Work out next version
+        id: next
+        env:
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+        run: |
+          bash .github/scripts/next-version.sh "$BEFORE" "$AFTER" | tee -a "$GITHUB_OUTPUT"
+
+  build:
+    needs: version
+    if: needs.version.outputs.release == 'true'
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - name: macos-universal
+            os: macos-latest
+          - name: linux-x86_64
+            os: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.os == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}
+
+      - name: Stamp version into Cargo.toml
+        run: perl -0pi -e 's/^version = "[^"]*"/version = "$ENV{VERSION}"/m' Cargo.toml
+
+      - name: Build macOS app (universal)
+        if: matrix.os == 'macos-latest'
+        run: |
+          cargo build --release --target aarch64-apple-darwin
+          cargo build --release --target x86_64-apple-darwin
+          mkdir -p target/universal
+          lipo -create -output target/universal/space-hog \
+            target/aarch64-apple-darwin/release/space-hog \
+            target/x86_64-apple-darwin/release/space-hog
+          SPACE_HOG_BIN=target/universal/space-hog ./bundle.sh
+          mkdir -p dist
+          ditto -c -k --keepParent "Space Hog.app" "dist/space-hog-v${VERSION}-macos-universal.zip"
+
+      - name: Build Linux binary
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev
+          cargo build --release
+          mkdir -p dist
+          tar -czf "dist/space-hog-v${VERSION}-linux-x86_64.tar.gz" -C target/release space-hog
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.name }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create tag and GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.version.outputs.tag }}
+        run: |
+          gh release create "$TAG" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "Space Hog $TAG" \
+            --generate-notes
